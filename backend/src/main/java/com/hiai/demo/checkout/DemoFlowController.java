@@ -53,13 +53,27 @@ class DemoFlowController {
     @PostMapping("/checkout/preview")
     CheckoutPreview checkoutPreview(@Valid @RequestBody CheckoutCommand command) {
         DemoCartService.CartView cart = carts.get(command.sessionId());
+
+        // L6 脏 ID 防御：前端显式指定 dishIds 时，必须全部存在于后端车中
         List<DemoCartService.CartLine> selectedItems = cart.items();
         if (command.dishIds() != null && !command.dishIds().isEmpty()) {
-            Set<String> selectedIds = Set.copyOf(command.dishIds());
+            Set<String> requestedIds = Set.copyOf(command.dishIds());
+            Set<String> cartItemIds = cart.items().stream()
+                    .map(DemoCartService.CartLine::dishId)
+                    .collect(java.util.stream.Collectors.toSet());
+            // 差集 = 前端传了但后端没有的脏 ID
+            List<String> missing = requestedIds.stream()
+                    .filter(id -> !cartItemIds.contains(id))
+                    .toList();
+            if (!missing.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "以下菜品不在购物车中，请重新选择：" + String.join(", ", missing));
+            }
             selectedItems = cart.items().stream()
-                    .filter(item -> selectedIds.contains(item.dishId()))
+                    .filter(item -> requestedIds.contains(item.dishId()))
                     .toList();
         }
+
         if (selectedItems.isEmpty()) {
             throw new IllegalArgumentException("购物车为空，暂时无法生成结算预览");
         }
@@ -68,9 +82,11 @@ class DemoFlowController {
                 .map(DemoCartService.CartLine::lineTotal)
                 .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
         String suffix = command.sessionId().replaceAll("[^A-Za-z0-9]", "");
-        suffix = suffix.substring(Math.max(0, suffix.length() - 6));
+        suffix = suffix.length() > 6 ? suffix.substring(suffix.length() - 6) : suffix;
+        String previewNoSuffix = suffix.isEmpty() ? "ANON" : suffix.toUpperCase();
+        long epoch = Instant.now().getEpochSecond();
         return new CheckoutPreview(
-                "DEMO-" + suffix.toUpperCase() + "-" + Instant.now().getEpochSecond(),
+                "DEMO-" + previewNoSuffix + "-" + epoch,
                 selectedItems, selectedCount, selectedTotal,
                 List.of(
                         new PaymentMethod("wechat_demo", "微信支付", "仅展示，不会唤起微信支付", "微"),

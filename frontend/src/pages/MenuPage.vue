@@ -5,7 +5,7 @@ import { api } from '../api'
 import { useCart } from '../cart'
 
 const router = useRouter()
-const { state, setQuantity, quantityOf } = useCart()
+const { state, setQuantity, quantityOf, seedDishMeta } = useCart()
 const menu = ref(null)
 const activeCategory = ref('')
 const searchKeyword = ref('')
@@ -13,6 +13,8 @@ const loading = ref(true)
 const error = ref('')
 const cartOpen = ref(false)
 const selectedDishIds = ref([])
+/** 用户是否主动做过"部分勾选/取消勾选"决策，L2 修复的核心标记 — 与抽屉开关解耦 */
+const cartEverCustomized = ref(false)
 
 const categoryIcons = { signature: '荐', hot: '热', staple: '食', drink: '饮' }
 const filteredDishes = computed(() => {
@@ -29,12 +31,50 @@ const selectedItemCount = computed(() => selectedItems.value.reduce((sum, item) 
 const selectedTotal = computed(() => selectedItems.value.reduce((sum, item) => sum + item.lineTotal, 0))
 const allSelected = computed(() => state.cart.items.length > 0 && selectedItems.value.length === state.cart.items.length)
 
+/** 预计算每个分类的购物车数量，避免模板内 N+1 filter/reduce */
+const cartCountByCategory = computed(() => {
+  const map = new Map()
+  if (menu.value) {
+    menu.value.categories.forEach(c => map.set(c.id, 0))
+  }
+  state.cart.items.forEach(item => {
+    const dish = menu.value?.dishes?.find(d => d.id === item.dishId)
+    if (dish) map.set(dish.categoryId, (map.get(dish.categoryId) || 0) + item.quantity)
+  })
+  return map
+})
+
+/**
+ * 凑整提示：金额到 ¥10/¥50/¥100 的心理门槛差额，自动选差额最小的。
+ * L7 修复：不再卡 diff <= 20 的硬限制，保证 ¥25~¥30 等缺口区间也有提示。
+ */
+const roundUpHint = computed(() => {
+  const total = state.cart.total
+  if (total <= 0) return ''
+  const thresholds = [
+    { label: '凑整',     target: Math.ceil(total / 10) * 10,    skipIf: 0 },
+    { label: '满50减5',  target: Math.ceil(total / 50) * 50,    skipIf: 5  },
+    { label: '满100减15', target: Math.ceil(total / 100) * 100,  skipIf: 15 },
+  ]
+  const candidates = thresholds
+    .map(t => ({ ...t, diff: +(t.target - total).toFixed(2) }))
+    .filter(c => c.diff > 0 && c.diff < 50)
+  if (!candidates.length) return ''
+  const best = candidates.reduce((a, b) => a.diff < b.diff ? a : b)
+  if (best.diff <= 20) {
+    return `再点 ¥${best.diff.toFixed(2)} 即可${best.label}`
+  }
+  return `已选 ¥${total.toFixed(2)}，再加 ¥${best.diff.toFixed(2)} 享${best.label}`
+})
+
 async function loadMenu() {
   loading.value = true
   error.value = ''
   try {
     menu.value = await api.menu()
     activeCategory.value = menu.value.categories[0]?.id || ''
+    // N2 修复：把菜品元数据注入 cart.js，让乐观更新能构造完整 CartLine
+    seedDishMeta(menu.value.dishes)
   } catch (err) {
     error.value = err.message
   } finally {
@@ -46,8 +86,17 @@ async function change(dishId, delta) {
   const nextQuantity = quantityOf(dishId) + delta
   try {
     await setQuantity(dishId, nextQuantity)
-    if (nextQuantity <= 0) selectedDishIds.value = selectedDishIds.value.filter(id => id !== dishId)
-  } catch (_) {}
+    if (nextQuantity <= 0) {
+      selectedDishIds.value = selectedDishIds.value.filter(id => id !== dishId)
+    } else if (!selectedDishIds.value.includes(dishId) && cartOpen.value) {
+      // N4 修复：抽屉开着时自动加菜 → 也置 cartEverCustomized，
+      // 防止用户关闭再打开时抽屉状态被全量同步覆盖
+      cartEverCustomized.value = true
+      selectedDishIds.value = [...selectedDishIds.value, dishId]
+    }
+  } catch (e) {
+    // L5 修复：吞掉 Promise rejection，错误已由 cart.js 写入 state.error
+  }
 }
 
 async function removeDish(dishId) {
@@ -55,22 +104,32 @@ async function removeDish(dishId) {
     await setQuantity(dishId, 0)
     selectedDishIds.value = selectedDishIds.value.filter(id => id !== dishId)
     if (!state.cart.items.length) cartOpen.value = false
-  } catch (_) {}
+  } catch (e) { /* 同上 */ }
 }
 
+// L2 修复：抽屉勾选"同步而非重置"，cartEverCustomized 与抽屉开关解耦。
+//  - cartEverCustomized = false → 用户从未做过自定义选择 → 全量同步 selectedDishIds
+//  - cartEverCustomized = true  → 用户做过自定义选择 → 增量清理（剔除脏 ID，保留勾选）
 function openCart() {
   if (!state.cart.itemCount) return
-  selectedDishIds.value = state.cart.items.map(item => item.dishId)
+  if (!cartEverCustomized.value) {
+    selectedDishIds.value = state.cart.items.map(item => item.dishId)
+  } else {
+    const currentIds = new Set(state.cart.items.map(i => i.dishId))
+    selectedDishIds.value = selectedDishIds.value.filter(id => currentIds.has(id))
+  }
   cartOpen.value = true
 }
 
 function toggleSelected(dishId) {
+  cartEverCustomized.value = true  // L2：用户主动改勾选 → 锁定
   selectedDishIds.value = selectedDishIds.value.includes(dishId)
     ? selectedDishIds.value.filter(id => id !== dishId)
     : [...selectedDishIds.value, dishId]
 }
 
 function toggleAllSelected() {
+  cartEverCustomized.value = true  // L2：用户全选/全不选 → 锁定
   selectedDishIds.value = allSelected.value ? [] : state.cart.items.map(item => item.dishId)
 }
 
@@ -127,8 +186,8 @@ onMounted(loadMenu)
           >
             <span class="cat-icon">{{ categoryIcons[category.id] || '菜' }}</span>
             <span class="cat-name">{{ category.name }}</span>
-            <span v-if="menu.dishes.filter(d => d.categoryId === category.id).reduce((sum, d) => sum + quantityOf(d.id), 0)" class="cat-badge">
-              {{ menu.dishes.filter(d => d.categoryId === category.id).reduce((sum, d) => sum + quantityOf(d.id), 0) }}
+            <span v-if="cartCountByCategory.get(category.id)" class="cat-badge">
+              {{ cartCountByCategory.get(category.id) }}
             </span>
           </button>
         </aside>
@@ -143,9 +202,13 @@ onMounted(loadMenu)
             <span class="cat-count">{{ activeDishes.length }} 道</span>
           </div>
 
-          <div v-if="!(searchKeyword ? filteredDishes : activeDishes).length" class="menu-empty">暂无相关菜品</div>
-          <article v-for="dish in (searchKeyword ? filteredDishes : activeDishes)" :key="dish.id" class="dish-card">
-            <div class="dish-img-wrap" :style="{ background: dish.artColor }">
+          <div v-if="!(searchKeyword ? filteredDishes : activeDishes).length" class="menu-empty">
+            <div class="empty-dish">🍽️</div>
+            <p>这里还没有菜品哦</p>
+            <p class="empty-sub">试试换个关键词，或返回看看「{{ menu.categories.find(c => c.id === activeCategory)?.name }}」？</p>
+          </div>
+          <article v-for="(dish, idx) in (searchKeyword ? filteredDishes : activeDishes)" :key="dish.id" class="dish-card">
+            <div class="dish-img-wrap" :style="{ background: `linear-gradient(135deg, ${dish.artColor} 0%, ${dish.artColor}${idx % 2 ? 'aa' : '55'} 100%)` }">
               <span class="dish-art">{{ dish.icon }}</span>
               <span v-if="dish.tag" class="badge-corner-tl">{{ dish.tag }}</span>
             </div>
@@ -220,6 +283,7 @@ onMounted(loadMenu)
         <div class="cart-info">
           <strong class="cart-total" :class="{ 'cart-total-zero': !state.cart.itemCount }">¥{{ state.cart.total.toFixed(2) }}</strong>
           <span class="cart-count">已选 {{ state.cart.itemCount }} 件</span>
+          <span v-if="roundUpHint" class="cart-hint">{{ roundUpHint }}</span>
         </div>
         <button class="checkout-btn" :class="{ 'checkout-active': state.cart.itemCount }" :disabled="!state.cart.itemCount" @click="openCart">去结算</button>
       </footer>
