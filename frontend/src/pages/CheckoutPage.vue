@@ -1,25 +1,51 @@
 <script setup>
-import { onMounted, ref } from 'vue'
-import { api } from '../api'
+import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { api, ApiError } from '../api'
 import { useCart } from '../cart'
 
-const { state } = useCart()
+const router = useRouter()
+const { state, loadCart } = useCart()
 const preview = ref(null)
 const selectedMethod = ref('wechat_demo')
 const loading = ref(true)
 const error = ref('')
+const cartGone = ref(false)  // L4 后端重启 / L6 脏 ID 导致购物车丢失
 const demoEnded = ref(false)
 const itemsExpanded = ref(true)
 
 async function loadPreview() {
   loading.value = true
   error.value = ''
+  cartGone.value = false
   try {
-    const selectedDishIds = JSON.parse(sessionStorage.getItem('hiai-demo-selected-dish-ids') || '[]')
+    // 确保后端最新车数据（防 L4 重启丢失）
+    await loadCart()
+    // L6：如果后端车已空，直接走友好回退
+    if (state.cart.itemCount === 0) {
+      cartGone.value = true
+      return
+    }
+    let selectedDishIds = []
+    try {
+      selectedDishIds = JSON.parse(sessionStorage.getItem('hiai-demo-selected-dish-ids') || '[]')
+      if (!Array.isArray(selectedDishIds)) selectedDishIds = []
+    } catch (_) { selectedDishIds = [] }
+
+    // L6 防御：过滤掉不在当前车中的脏 ID
+    const currentIds = new Set(state.cart.items.map(i => i.dishId))
+    selectedDishIds = selectedDishIds.filter(id => currentIds.has(id))
+
+    // 如果 sessionStorage 有脏 ID 全被过滤掉，退化为"全车结算"
     preview.value = await api.checkoutPreview(state.sessionId, selectedDishIds)
     selectedMethod.value = preview.value.paymentMethods[0]?.code || ''
   } catch (err) {
-    error.value = err.message
+    if (err instanceof ApiError && err.status === 400) {
+      // L4 / L6：购物车已空或无效 → 友好回退
+      cartGone.value = true
+    } else {
+      error.value = err.message
+    }
   } finally {
     loading.value = false
   }
@@ -42,6 +68,15 @@ onMounted(loadPreview)
     </header>
 
     <div v-if="loading" class="full-state"><div class="loader"></div><p>正在核对订单金额…</p></div>
+
+    <!-- L4/L6 购物车丢失友好回退 -->
+    <div v-else-if="cartGone" class="empty-card cart-gone-state">
+      <div class="state-sign warning">🍽️</div>
+      <h1>购物车里暂时没有菜品了</h1>
+      <p class="cart-gone-hint">可能是服务刚刚刷新了数据，或者您选择的菜品已不在车中。</p>
+      <router-link to="/" class="plain-primary">返回点餐</router-link>
+    </div>
+
     <div v-else-if="error" class="empty-card"><div class="state-sign">!</div><h1>暂时无法结算</h1><p>{{ error }}</p><button class="plain-primary" @click="loadPreview">重新加载</button></div>
     <div v-else-if="demoEnded" class="empty-card demo-complete"><div class="state-sign success">✓</div><h1>流程演示到这里结束</h1><p>没有创建真实支付单，也没有调用微信或其他扣款接口。</p><router-link to="/" class="plain-primary">返回点餐</router-link></div>
 
@@ -83,3 +118,8 @@ onMounted(loadPreview)
     </template>
   </section>
 </template>
+
+<style>
+.state-sign.warning { background: #fef3c7; color: #92400e; }
+.cart-gone-hint { font-size: 13px; color: #6b5648; line-height: 1.6; }
+</style>

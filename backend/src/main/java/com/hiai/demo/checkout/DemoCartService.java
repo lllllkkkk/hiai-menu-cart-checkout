@@ -11,7 +11,17 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 class DemoCartService {
+
+    /** 单个演示进程最多保留的会话数，超过会清理最旧的 */
+    private static final int MAX_SESSIONS = 2000;
+
+    /** 超过 30 分钟未访问的会话视为过期，惰性清理 */
+    private static final long TTL_MS = 30L * 60 * 1000;
+
     private final Map<String, Map<String, Integer>> carts = new ConcurrentHashMap<>();
+
+    /** 每个 sessionId 最后一次写入/访问的时间戳（ms） */
+    private final Map<String, Long> lastAccessAt = new ConcurrentHashMap<>();
 
     CartView get(String sessionId) {
         validateSession(sessionId);
@@ -41,7 +51,42 @@ class DemoCartService {
         Map<String, Integer> cart = carts.computeIfAbsent(sessionId, ignored -> new ConcurrentHashMap<>());
         if (quantity == 0) cart.remove(dishId);
         else cart.put(dishId, quantity);
+        if (cart.isEmpty()) {
+            carts.remove(sessionId);
+            lastAccessAt.remove(sessionId);
+        } else {
+            touch(sessionId);
+            evictStaleAndEnforceCap();
+        }
         return get(sessionId);
+    }
+
+    private void touch(String sessionId) {
+        lastAccessAt.put(sessionId, System.currentTimeMillis());
+    }
+
+    /** 惰性清理：删除过期 session + 容量兜底。每次写入时调用。 */
+    private void evictStaleAndEnforceCap() {
+        long now = System.currentTimeMillis();
+        List<String> stale = new ArrayList<>();
+        lastAccessAt.forEach((sid, ts) -> {
+            if (now - ts > TTL_MS) stale.add(sid);
+        });
+        for (String sid : stale) {
+            carts.remove(sid);
+            lastAccessAt.remove(sid);
+        }
+        // 容量兜底：超上限时清最旧的
+        if (carts.size() > MAX_SESSIONS) {
+            lastAccessAt.entrySet().stream()
+                    .sorted(Map.Entry.comparingByValue())
+                    .limit(carts.size() - MAX_SESSIONS)
+                    .map(Map.Entry::getKey)
+                    .forEach(sid -> {
+                        carts.remove(sid);
+                        lastAccessAt.remove(sid);
+                    });
+        }
     }
 
     private static void validateSession(String sessionId) {
